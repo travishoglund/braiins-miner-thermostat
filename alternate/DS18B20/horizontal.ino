@@ -12,6 +12,7 @@
 #include <ArduinoJson.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
+// This code is meant for the Horizontal S9 Space Heaters (not multiple miners)
 
 #define SDA 18
 #define SCL 19
@@ -43,11 +44,13 @@ float minerCurrentHashrateInTh;
 int minerCurrentPowerInWatts = 0;
 int minerCurrentAcceptedShares = 0;
 int minerCurrentRejectedShares = 0;
-int thermostatDeadbandRange = 3;
+int thermostatDeadbandRange = 2;
 int thermostatTargetTemp = 75;
 int thermostatCurrentTemp = 71;
 bool minerIsMining = true;
 bool debug = false;
+bool minerConnected = false;
+bool forceConfig = false;
 
 
 //Network Variables - do not change these
@@ -339,16 +342,16 @@ void checkRoomTemperature() {
   if(tempFahrenheit > 0) {
     if( tempFahrenheit <= (thermostatTargetTemp - thermostatDeadbandRange) ) {
     startMinerMining();
-  } else if(tempFahrenheit >= (thermostatTargetTemp + thermostatDeadbandRange) ) {
-    stopMinerMining();
-  }
+    } else if(tempFahrenheit >= (thermostatTargetTemp + thermostatDeadbandRange) ) {
+      stopMinerMining();
+    }
 
-  int currentTemperatureReading = (int)(tempFahrenheit + 0.5);
-  if(currentTemperatureReading > 0 && currentTemperatureReading != thermostatCurrentTemp && screen != "init") {
-    thermostatCurrentTemp = currentTemperatureReading;
-    lcd.setTextSize(2);
-    printLeft(" (Now: " + (String)thermostatCurrentTemp + ") ", 15, 100, TFT_WHITE);
-  }
+    int currentTemperatureReading = (int)(tempFahrenheit + 0.5);
+    if(currentTemperatureReading > 0 && currentTemperatureReading != thermostatCurrentTemp && screen != "init") {
+      thermostatCurrentTemp = currentTemperatureReading;
+      lcd.setTextSize(2);
+      printLeft(" (Now: " + (String)thermostatCurrentTemp + ") ", 15, 100, TFT_WHITE);
+    }
   }
 
 }
@@ -367,6 +370,7 @@ void updateMinerData(){
 
   DeserializationError error = deserializeJson(doc, summaryResponse);
   if (!error) {
+    minerConnected = true;
     minerCurrentHashrateInTh = doc["SUMMARY"][0]["MHS 5s"].as<float>() / 1000000;
     minerCurrentAcceptedShares = doc["SUMMARY"][0]["Accepted"].as<int>();
     minerCurrentRejectedShares = doc["SUMMARY"][0]["Rejected"].as<int>();
@@ -459,6 +463,13 @@ void homeScreen(){
   // Row 7 - Pool
   printLeft("Pool", 210, startSummaryAtY + 190, TFT_WHITE);
   printRight((String)minerPoolAddress, -20, startSummaryAtY + 190, TFT_WHITE);
+
+  // Miner Connection & Reset Button
+  lcd.drawCircle(460, 300, 10, (minerConnected == true ? TFT_GREEN : TFT_RED));
+  lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+  lcd.setTextSize(1);
+  lcd.setCursor(20, 300);
+  lcd.print("Reset");
 
 }
 
@@ -554,10 +565,10 @@ void createWebServer() {
       content = "\r\n<h1>Bitcoin Thermostat Configuration</h1>";
       content += "<p>";
       content += "</p><form method='get' action='setting'>";
-      content += "<label>Wifi Network: </label><input name='ssid' type='text' length=32><br />";
-      content += "<label>Wifi Password: </label><input name='ssidpass' type='text' length=64><br /><br />";
+      content += "<label>Wifi Network: </label><input name='ssid' type='text' length=32 value='"+esid+"'><br />";
+      content += "<label>Wifi Password: </label><input name='ssidpass' type='text' length=64 value='"+epass+"'><br /><br />";
       content += "<label>Deadband Range: </label><input name='deadband' type='text' value='"+edeadband+"' length=1><br /><br />";
-      content += "<label>Miner IP Address: </label><input name='minerip' type='text' length=15><br /><br />";
+      content += "<label>Miner IP Address: </label><input name='minerip' type='text' length=15 value='"+eMinerIp+"'><br /><br />";
       content += "<input type='submit'></form>";
       content += "<style>body{background: #000; color: #FFF; font-family: Arial;} input[type=submit]{background: #000; border: 1px solid #f2a900; color: #f2a900; padding: 8px 16px;} label {display: block;} input[type=text]{background: #000; border: 1px solid #f2a900; color: #f2a900; margin-bottom: 10px; height: 30px; line-height: 30px; width: 100%; max-width: 300px; }</style>";
       content += "</html>";
@@ -579,7 +590,7 @@ void createWebServer() {
       String qminerip = server.arg("minerip");
       if (qsid.length() > 0 && qpass.length() > 0) {
         if(debug) Serial.println("clearing eeprom");
-        for (int i = 0; i < 112; ++i) {
+        for (int i = 0; i < 113; ++i) {
           EEPROM.write(i, 0);
         }
         // Write EEPROM ssid
@@ -593,14 +604,15 @@ void createWebServer() {
           EEPROM.write(32 + i, qpass[i]);
         }
         // Write EEPROM deadband
-        for (int i = 0; i < qdeadband.length(); ++i)
-        {
-          EEPROM.write(96 + i, qdeadband[i]);
-        }
+        EEPROM.write(96, qdeadband[0]);
+
+        // Write EEPROM reset
+        EEPROM.write(97, 0);
+
         // Write EEPROM miner ip
         for (int i = 0; i < qminerip.length(); ++i)
         {
-          EEPROM.write(97 + i, qminerip[i]);
+          EEPROM.write(98 + i, qminerip[i]);
         }
 
         EEPROM.commit();
@@ -655,12 +667,16 @@ void setup() {
   addApplicationInfo("Reading SSID info");
   // Read eeprom ssid
   for (int i = 0; i < 32; ++i) {
-    esid += char(EEPROM.read(i));
+    if(EEPROM.read(i) != 255 && EEPROM.read(i) != 0) {
+      esid += char(EEPROM.read(i));
+    }
   }
 
   // Read eeprom password
   for (int i = 32; i < 96; ++i) {
-    epass += char(EEPROM.read(i));
+    if(EEPROM.read(i) != 255 && EEPROM.read(i) != 0) {
+      epass += char(EEPROM.read(i));
+    }
   }
 
   // Read eeprom deadband range
@@ -672,9 +688,16 @@ void setup() {
     }
   }
 
+  // Read eeprom force config
+  if(EEPROM.read(97) == 1) {
+    forceConfig = true;
+  }
+
   // Read eeprom miner ip
-  for (int i = 97; i < 112; ++i) {
-    eMinerIp += char(EEPROM.read(i));
+  for (int i = 98; i < 113; ++i) {
+    if(EEPROM.read(i) != 255 && EEPROM.read(i) != 0) {
+      eMinerIp += char(EEPROM.read(i));
+    }
   }
   minerIPAddressString = eMinerIp.c_str();
 
@@ -689,7 +712,7 @@ void setup() {
 void loop() {
 
   // Wifi is connected properly
-  if ((WiFi.status() == WL_CONNECTED))
+  if (forceConfig == false && (WiFi.status() == WL_CONNECTED))
   {
     // Refresh temperature status every 5 seconds
     if(screen != "init" && (millis() - lastTemperatureCheckInterrupt > 3000)) {
@@ -741,15 +764,20 @@ void loop() {
             printLeft((String)thermostatTargetTemp, 65, 46, TFT_WHITE);
           }
         }
+        // Enter Config Mode
+        if(x >= 0 && x <= 90 && y >= 300 && y <= 320) {
+          EEPROM.write(97, 1);
+          EEPROM.commit();
+          ESP.restart();
+        }
       }
   }
 
   // Setup Access Point due to no internet connection
   if(firstRun) {
-    if (testWifi() && (digitalRead(15) != 1))
+    if (forceConfig == false && testWifi() && (digitalRead(15) != 1))
     {} else {
       // Setup HotSpot and show user that Connection is ready
-      // Connect to Azteco ATM Wifi Network to configure
       firstRun = false;
       clearApplicationInfo();
       addApplicationInfo("No Wifi, Hotspot on");
