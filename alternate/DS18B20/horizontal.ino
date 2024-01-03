@@ -10,7 +10,8 @@
 #include <EEPROM.h>
 #include "qrcoded.h"
 #include <ArduinoJson.h>
-#include <Adafruit_MPL115A2.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
 
 #define SDA 18
 #define SCL 19
@@ -68,9 +69,6 @@ bool testWifi(void);
 void launchWeb(void);
 void setupAP(void);
 
-// Setting up temperature reader
-Adafruit_MPL115A2 mpl115a2;
-
 // Setting up http for API Calls
 WiFiClient client;
 HTTPClient http;
@@ -80,6 +78,10 @@ WebServer server(80);
 
 // LCD Display
 static LGFX lcd;
+
+// Temperature Sensor
+OneWire oneWire(2);
+DallasTemperature tempSensor(&oneWire);
 
 const unsigned char bitcoinLogo [] PROGMEM =                                  // 'Bitcoin Logo', 128x64px
 {
@@ -217,7 +219,7 @@ void printCenter(const String buf, int x, int y, long color = TFT_WHITE)        
   uint16_t w, h;
   getTextBounds(buf.c_str(), x, y, &x1, &y1, &w, &h);                     //Calculate string width
   lcd.setTextColor(color, TFT_BLACK);
-  lcd.setCursor((x - w / 2) + (320 / 2), y);                          //Set cursor to print string in centre
+  lcd.setCursor((x - w / 2) + (480 / 2), y);                          //Set cursor to print string in centre
   lcd.print(buf);                                                     //Display string
 }
 
@@ -227,7 +229,7 @@ void printRight(const String buf, int x, int y, long color = TFT_WHITE)         
   uint16_t w, h;
   getTextBounds(buf.c_str(), x, y, &x1, &y1, &w, &h);                     //Calculate string width
   lcd.setTextColor(color, TFT_BLACK);
-  lcd.setCursor(320 + x - w, y);                          //Set cursor to print string in centre
+  lcd.setCursor(480 + x - w, y);                          //Set cursor to print string in centre
   lcd.print(buf);                                                     //Display string
 }
 
@@ -325,23 +327,28 @@ void startMinerMining() {
  * Checks the room temperature and pauses/starts mining
  */
 void checkRoomTemperature() {
+
   lastTemperatureCheckInterrupt = millis();
 
   // Refresh Temperature
-  float pressureKPA = 0, temperatureC = 0;
-  mpl115a2.getPT(&pressureKPA,&temperatureC);
-  float thermostatReadTempInF = (temperatureC * 1.8 + 32);
-  if(debug) Serial.println(thermostatReadTempInF);
-  if( thermostatReadTempInF <= (thermostatTargetTemp - thermostatDeadbandRange) ) {
+  tempSensor.requestTemperatures();
+  float tempCelsius = tempSensor.getTempCByIndex(0);
+  float tempFahrenheit = tempCelsius * 9 / 5 + 32;
+
+  if(debug) Serial.println(tempFahrenheit);
+  if(tempFahrenheit > 0) {
+    if( tempFahrenheit <= (thermostatTargetTemp - thermostatDeadbandRange) ) {
     startMinerMining();
-  } else if(thermostatReadTempInF >= (thermostatTargetTemp + thermostatDeadbandRange) ) {
+  } else if(tempFahrenheit >= (thermostatTargetTemp + thermostatDeadbandRange) ) {
     stopMinerMining();
   }
-  int currentTemperatureReading = (int)(thermostatReadTempInF + 0.5);
-  if(currentTemperatureReading != thermostatCurrentTemp && screen != "init") {
+
+  int currentTemperatureReading = (int)(tempFahrenheit + 0.5);
+  if(currentTemperatureReading > 0 && currentTemperatureReading != thermostatCurrentTemp && screen != "init") {
     thermostatCurrentTemp = currentTemperatureReading;
     lcd.setTextSize(2);
-    printCenter(" (Currently: " + (String)thermostatCurrentTemp + ") ", 0, 110, TFT_WHITE);
+    printLeft(" (Now: " + (String)thermostatCurrentTemp + ") ", 15, 100, TFT_WHITE);
+  }
   }
 
 }
@@ -403,54 +410,54 @@ void infoScreen()
 void homeScreen(){
 
   clearApplicationInfo();
-  int startSummaryAtY = 160;
+  int startSummaryAtY = 12;
 
   lcd.fillScreen(TFT_BLACK);
   lcd.setTextColor(TFT_ORANGE, TFT_BLACK);
   lcd.setTextSize(2);
 
   // Thermostat Settings
-  printCenter("Miner Thermostat", 0, 12, TFT_ORANGE);
+  printLeft("Thermostat", 30, 12, TFT_ORANGE);
   lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-  lcd.setTextSize(6);
-  printCenter((String)thermostatTargetTemp, 0, 46, TFT_WHITE);
-  printCenter("-", -70, 46, TFT_WHITE);
-  printCenter("+", 90, 46, TFT_WHITE);
+  lcd.setTextSize(4);
+  printLeft((String)thermostatTargetTemp, 65, 46, TFT_WHITE);
+  printLeft("-", 25, 46, TFT_WHITE);
+  printLeft("+", 125, 46, TFT_WHITE);
   lcd.setTextSize(2);
-  printCenter(" (Currently: " + (String)thermostatCurrentTemp + ") ", 0, 110, TFT_WHITE);
+  printLeft(" (Now: " + (String)thermostatCurrentTemp + ") ", 20, 100, TFT_WHITE);
   lcd.setTextColor(TFT_ORANGE, TFT_BLACK);
   lcd.setTextSize(2);
 
   // Miner Summary
-  printCenter("Miner Summary", 0, startSummaryAtY, TFT_ORANGE);
+  printLeft("Summary", 300, startSummaryAtY, TFT_ORANGE);
   lcd.setTextColor(TFT_WHITE, TFT_BLACK);
   lcd.setTextSize(1);
   // Row 1 - Mining
-  printLeft("Mining", 20, startSummaryAtY + 30, TFT_WHITE);
+  printLeft("Mining", 210, startSummaryAtY + 30, TFT_WHITE);
   printRight(minerIsMining ? "Active" : "Paused", -20, startSummaryAtY + 30, TFT_WHITE);
   // Row 1 - IP
-  printLeft("Miner IP", 20, startSummaryAtY + 50, TFT_WHITE);
+  printLeft("Miner IP", 210, startSummaryAtY + 50, TFT_WHITE);
   printRight((String)minerIPAddressString, -20, startSummaryAtY + 50, TFT_WHITE);
   // Row 2 - Deadband
-  printLeft("Deadband", 20, startSummaryAtY + 70, TFT_WHITE);
+  printLeft("Deadband", 210, startSummaryAtY + 70, TFT_WHITE);
   printRight("(+-) " + (String)thermostatDeadbandRange + " degrees", -20, startSummaryAtY + 70, TFT_WHITE);
   // Row 3 - Hashrate
-  printLeft("Hashrate", 20, startSummaryAtY + 90, TFT_WHITE);
+  printLeft("Hashrate", 210, startSummaryAtY + 90, TFT_WHITE);
   printRight((String)minerCurrentHashrateInTh + " TH/s", -20, startSummaryAtY + 90, TFT_WHITE);
   // Row 4 - Power
-  printLeft("Power", 20, startSummaryAtY + 110, TFT_WHITE);
+  printLeft("Power", 210, startSummaryAtY + 110, TFT_WHITE);
   printRight((String)minerCurrentPowerInWatts + " watts", -20, startSummaryAtY + 110, TFT_WHITE);
   // Row 5 - Shares
-  printLeft("Shares", 20, startSummaryAtY + 130, TFT_WHITE);
+  printLeft("Shares", 210, startSummaryAtY + 130, TFT_WHITE);
   printRight(String(minerCurrentAcceptedShares) + " shares", -20, startSummaryAtY + 130, TFT_WHITE);
   // Row 6 - Rejected Shares
-  printLeft("Rejected", 20, startSummaryAtY + 150, TFT_WHITE);
+  printLeft("Rejected", 210, startSummaryAtY + 150, TFT_WHITE);
   printRight(String(minerCurrentRejectedShares) + " shares", -20, startSummaryAtY + 150, TFT_WHITE);
   // Row 7 - User
-  printLeft("User", 20, startSummaryAtY + 170, TFT_WHITE);
+  printLeft("User", 210, startSummaryAtY + 170, TFT_WHITE);
   printRight((String)minerUser, -20, startSummaryAtY + 170, TFT_WHITE);
   // Row 7 - Pool
-  printLeft("Pool", 20, startSummaryAtY + 190, TFT_WHITE);
+  printLeft("Pool", 210, startSummaryAtY + 190, TFT_WHITE);
   printRight((String)minerPoolAddress, -20, startSummaryAtY + 190, TFT_WHITE);
 
 }
@@ -615,20 +622,16 @@ void createWebServer() {
 
 void setup() {
 
-  // Initialize SDA/SCL via WIRE
-  Wire.begin(SDA, SCL);
-  if (! mpl115a2.begin()) {
-    addApplicationInfo("Sensor not found! Check wiring");
-    while (1);
-  }
+  // Initialize temperature sensor
+  tempSensor.begin();
 
   // Setup Screen
   lcd.init();
-  lcd.setRotation(0);
+  lcd.setRotation(1);
   lcd.fillScreen(TFT_BLACK);
 
   // Draw Logo
-  lcd.drawBitmap(96, 208, bitcoinLogo, 128, 64, TFT_ORANGE);
+  lcd.drawBitmap(176, 128, bitcoinLogo, 128, 64, TFT_ORANGE);
 
   // Setup Serial
   Serial.begin(9600); //Initialising Serial Monitor
@@ -719,23 +722,23 @@ void loop() {
     // Temperature Adjustment
     if (lcd.getTouch(&x, &y)) {
         // Adjust temp down
-        if(x > 45 && x < 95 && y > 45 && y < 95) {
+        if(x > 0 && x < 75 && y > 45 && y < 95) {
           if(millis() - lastTouchInterrupt > 500) {
             lastTouchInterrupt = millis();
             thermostatTargetTemp--;
             lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-            lcd.setTextSize(6);
-            printCenter((String)thermostatTargetTemp, 0, 46, TFT_WHITE);
+            lcd.setTextSize(4);
+            printLeft((String)thermostatTargetTemp, 65, 46, TFT_WHITE);
           }
         }
         // Adjust temp up
-        if(x > 225 && x < 275 && y > 45 && y < 95) {
+        if(x > 105 && x < 180 && y > 45 && y < 95) {
           if(millis() - lastTouchInterrupt > 500) {
             lastTouchInterrupt = millis();
             thermostatTargetTemp++;
             lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-            lcd.setTextSize(6);
-            printCenter((String)thermostatTargetTemp, 0, 46, TFT_WHITE);
+            lcd.setTextSize(4);
+            printLeft((String)thermostatTargetTemp, 65, 46, TFT_WHITE);
           }
         }
       }
@@ -754,7 +757,7 @@ void loop() {
       addApplicationInfo("Set wifi ssid at:");
       addApplicationInfo("192.168.4.1");
       infoScreen();
-      showQrCode("http://192.168.4.1", 20, 200);
+      showQrCode("http://192.168.4.1", 295, 125);
       launchWeb();
       setupAP();// Setup HotSpot
     }

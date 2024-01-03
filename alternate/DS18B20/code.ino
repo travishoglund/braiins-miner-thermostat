@@ -2,7 +2,6 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include "sdkconfig.h"
-#include <Hash.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <WiFiUdp.h>
@@ -10,7 +9,8 @@
 #include <EEPROM.h>
 #include "qrcoded.h"
 #include <ArduinoJson.h>
-#include <Adafruit_MPL115A2.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
 
 #define SDA 18
 #define SCL 19
@@ -34,19 +34,21 @@ boolean firstRun = true;
 static int32_t x,y;
 
 // Miner and Thermostat Settings
-String minerIPAddressString = "";
-IPAddress minerIPAddress;
+IPAddress minerIpAddresses[5];
 String minerUser;
 String minerPoolAddress;
+String minerIpsFragmented;
 float minerCurrentHashrateInTh;
 int minerCurrentPowerInWatts = 0;
 int minerCurrentAcceptedShares = 0;
 int minerCurrentRejectedShares = 0;
-int thermostatDeadbandRange = 3;
+int thermostatDeadbandRange = 2;
 int thermostatTargetTemp = 75;
 int thermostatCurrentTemp = 71;
 bool minerIsMining = true;
+int minersConnected = 0;
 bool debug = false;
+bool forceConfig = false;
 
 
 //Network Variables - do not change these
@@ -58,18 +60,19 @@ String st;
 String content;
 String esid;
 String epass = "";
-String edeadband = "3";
-String eMinerIp = "";
+String edeadband = "2";
+String eMinerIp1 = "";
+String eMinerIp2 = "";
+String eMinerIp3 = "";
+String eMinerIp4 = "";
+String eMinerIp5 = "";
 const int httpsPort = 443;
 
 
-//Function Decalration
+//Function Declaration
 bool testWifi(void);
 void launchWeb(void);
 void setupAP(void);
-
-// Setting up temperature reader
-Adafruit_MPL115A2 mpl115a2;
 
 // Setting up http for API Calls
 WiFiClient client;
@@ -80,6 +83,10 @@ WebServer server(80);
 
 // LCD Display
 static LGFX lcd;
+
+// Temperature Sensor
+OneWire oneWire(2);
+DallasTemperature tempSensor(&oneWire);
 
 const unsigned char bitcoinLogo [] PROGMEM =                                  // 'Bitcoin Logo', 128x64px
 {
@@ -281,11 +288,10 @@ void clearApplicationInfo() {
 /**
  * Miner Connection
  */
-String sendMinerCommand(String command) {
+String sendMinerCommand(String command, IPAddress minerIp) {
 
-  if(debug) ("Connecting to Miner");
-  minerIPAddress.fromString(minerIPAddressString);
-  if (client.connect(minerIPAddress, (uint16_t)4028, int32_t(1000))) {                 // Establish a connection
+  if(debug) ("Connecting to Miner: " + minerIp.toString());
+  if (client.connect(minerIp, (uint16_t)4028, int32_t(1000))) {                 // Establish a connection
 
       if (client.connected()) {
         client.println("{\"command\": \""+command+"\"}");
@@ -308,17 +314,27 @@ String sendMinerCommand(String command) {
 /*
  * Halt Mining - the room is too warm
  */
-void stopMinerMining() {
+void stopMinersMining() {
+  if(minerIsMining != false) paintScreen = true;
   minerIsMining = false;
-  sendMinerCommand("pause");
+  for (int i = 0; i < 5; i++) {
+    if(minerIpAddresses[i].toString()) {
+      sendMinerCommand("pause", minerIpAddresses[i]);
+    }
+  }
 }
 
 /*
  * Resume Mining - the room is too cool
  */
-void startMinerMining() {
+void startMinersMining() {
+  if(minerIsMining != true) paintScreen = true;
   minerIsMining = true;
-  sendMinerCommand("resume");
+  for (int i = 0; i < 5; i++) {
+    if(minerIpAddresses[i].toString()) {
+      sendMinerCommand("resume", minerIpAddresses[i]);
+    }
+  }
 }
 
 /*
@@ -328,16 +344,18 @@ void checkRoomTemperature() {
   lastTemperatureCheckInterrupt = millis();
 
   // Refresh Temperature
-  float pressureKPA = 0, temperatureC = 0;
-  mpl115a2.getPT(&pressureKPA,&temperatureC);
-  float thermostatReadTempInF = (temperatureC * 1.8 + 32);
-  if(debug) Serial.println(thermostatReadTempInF);
-  if( thermostatReadTempInF <= (thermostatTargetTemp - thermostatDeadbandRange) ) {
-    startMinerMining();
-  } else if(thermostatReadTempInF >= (thermostatTargetTemp + thermostatDeadbandRange) ) {
-    stopMinerMining();
+  tempSensor.requestTemperatures();
+  float tempCelsius = tempSensor.getTempCByIndex(0);
+  float tempFahrenheit = tempCelsius * 9 / 5 + 32;
+
+  if(debug) Serial.println(tempFahrenheit);
+  if( tempFahrenheit <= (thermostatTargetTemp - thermostatDeadbandRange) ) {
+    startMinersMining();
+  } else if(tempFahrenheit >= (thermostatTargetTemp + thermostatDeadbandRange) ) {
+    stopMinersMining();
   }
-  int currentTemperatureReading = (int)(thermostatReadTempInF + 0.5);
+
+  int currentTemperatureReading = (int)(tempFahrenheit + 0.5);
   if(currentTemperatureReading != thermostatCurrentTemp && screen != "init") {
     thermostatCurrentTemp = currentTemperatureReading;
     lcd.setTextSize(2);
@@ -352,25 +370,38 @@ void checkRoomTemperature() {
 void updateMinerData(){
 
   lastMinerUpdateInterrupt = millis();
+  minersConnected = 0;
+  minerCurrentPowerInWatts = 0;
+  minerCurrentHashrateInTh = 0;
+  minerCurrentAcceptedShares = 0;
+  minerCurrentRejectedShares = 0;
 
-  String summaryResponse = sendMinerCommand("summary");
-  String tunerResponse = sendMinerCommand("tunerstatus");
-  String poolsResponse = sendMinerCommand("pools");
+
+  for (int i = 0; i < 5; i++) {
+    if(minerIpAddresses[i].toString()) {
+      String summaryResponse = sendMinerCommand("summary", minerIpAddresses[i]);
+      String tunerResponse = sendMinerCommand("tunerstatus", minerIpAddresses[i]);
+      StaticJsonDocument<2000> doc;
+
+      DeserializationError error = deserializeJson(doc, summaryResponse);
+      if (!error) {
+        minersConnected = minersConnected + 1;
+        minerCurrentHashrateInTh = minerCurrentHashrateInTh + ( doc["SUMMARY"][0]["MHS 5s"].as<float>() / 1000000 );
+        minerCurrentAcceptedShares = minerCurrentAcceptedShares + doc["SUMMARY"][0]["Accepted"].as<int>();
+        minerCurrentRejectedShares = minerCurrentRejectedShares + doc["SUMMARY"][0]["Rejected"].as<int>();
+      }
+
+      error = deserializeJson(doc, tunerResponse);
+      if (!error) {
+        minerCurrentPowerInWatts = minerCurrentPowerInWatts + doc["TUNERSTATUS"][0]["ApproximateMinerPowerConsumption"].as<int>();
+      }
+    }
+  }
+
+  // Connect to the first miner only for pool information to show on Thermostat
+  String poolsResponse = sendMinerCommand("pools", minerIpAddresses[0]);
   StaticJsonDocument<2000> doc;
-
-  DeserializationError error = deserializeJson(doc, summaryResponse);
-  if (!error) {
-    minerCurrentHashrateInTh = doc["SUMMARY"][0]["MHS 5s"].as<float>() / 1000000;
-    minerCurrentAcceptedShares = doc["SUMMARY"][0]["Accepted"].as<int>();
-    minerCurrentRejectedShares = doc["SUMMARY"][0]["Rejected"].as<int>();
-  }
-
-  error = deserializeJson(doc, tunerResponse);
-  if (!error) {
-    minerCurrentPowerInWatts = doc["TUNERSTATUS"][0]["ApproximateMinerPowerConsumption"].as<int>();
-  }
-
-  error = deserializeJson(doc, poolsResponse);
+  DeserializationError error = deserializeJson(doc, poolsResponse);
   if (!error) {
     minerUser = doc["POOLS"][0]["User"].as<String>();
     minerPoolAddress = doc["POOLS"][0]["Stratum URL"].as<String>();
@@ -429,8 +460,8 @@ void homeScreen(){
   printLeft("Mining", 20, startSummaryAtY + 30, TFT_WHITE);
   printRight(minerIsMining ? "Active" : "Paused", -20, startSummaryAtY + 30, TFT_WHITE);
   // Row 1 - IP
-  printLeft("Miner IP", 20, startSummaryAtY + 50, TFT_WHITE);
-  printRight((String)minerIPAddressString, -20, startSummaryAtY + 50, TFT_WHITE);
+  printLeft("Miner IP(s)", 20, startSummaryAtY + 50, TFT_WHITE);
+  printRight((String)minerIpsFragmented, -20, startSummaryAtY + 50, TFT_WHITE);
   // Row 2 - Deadband
   printLeft("Deadband", 20, startSummaryAtY + 70, TFT_WHITE);
   printRight("(+-) " + (String)thermostatDeadbandRange + " degrees", -20, startSummaryAtY + 70, TFT_WHITE);
@@ -452,6 +483,15 @@ void homeScreen(){
   // Row 7 - Pool
   printLeft("Pool", 20, startSummaryAtY + 190, TFT_WHITE);
   printRight((String)minerPoolAddress, -20, startSummaryAtY + 190, TFT_WHITE);
+
+  // Miner Connection & Reset Button
+  lcd.drawCircle(300, 460, 10, (minersConnected > 0 ? TFT_GREEN : TFT_RED));
+  lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+  lcd.setTextSize(1);
+  lcd.setCursor(298, 456);
+  lcd.print(minersConnected);
+  lcd.setCursor(20, 460);
+  lcd.print("Reset");
 
 }
 
@@ -547,10 +587,14 @@ void createWebServer() {
       content = "\r\n<h1>Bitcoin Thermostat Configuration</h1>";
       content += "<p>";
       content += "</p><form method='get' action='setting'>";
-      content += "<label>Wifi Network: </label><input name='ssid' type='text' length=32><br />";
-      content += "<label>Wifi Password: </label><input name='ssidpass' type='text' length=64><br /><br />";
+      content += "<label>Wifi Network: </label><input name='ssid' type='text' length=32 value='"+esid+"'><br />";
+      content += "<label>Wifi Password: </label><input name='ssidpass' type='text' length=64 value='"+epass+"'><br /><br />";
       content += "<label>Deadband Range: </label><input name='deadband' type='text' value='"+edeadband+"' length=1><br /><br />";
-      content += "<label>Miner IP Address: </label><input name='minerip' type='text' length=15><br /><br />";
+      content += "<label>Miner #1 IP Address: </label><input name='minerip1' type='text' value='"+eMinerIp1+"'length=15><br /><br />";
+      content += "<label>Miner #2 IP Address: </label><input name='minerip2' type='text' value='"+eMinerIp2+"'length=15><br /><br />";
+      content += "<label>Miner #3 IP Address: </label><input name='minerip3' type='text' value='"+eMinerIp3+"'length=15><br /><br />";
+      content += "<label>Miner #4 IP Address: </label><input name='minerip4' type='text' value='"+eMinerIp4+"'length=15><br /><br />";
+      content += "<label>Miner #5 IP Address: </label><input name='minerip5' type='text' value='"+eMinerIp5+"'length=15><br /><br />";
       content += "<input type='submit'></form>";
       content += "<style>body{background: #000; color: #FFF; font-family: Arial;} input[type=submit]{background: #000; border: 1px solid #f2a900; color: #f2a900; padding: 8px 16px;} label {display: block;} input[type=text]{background: #000; border: 1px solid #f2a900; color: #f2a900; margin-bottom: 10px; height: 30px; line-height: 30px; width: 100%; max-width: 300px; }</style>";
       content += "</html>";
@@ -569,10 +613,14 @@ void createWebServer() {
       String qsid = server.arg("ssid");
       String qpass = server.arg("ssidpass");
       String qdeadband = server.arg("deadband");
-      String qminerip = server.arg("minerip");
+      String qminerip1 = server.arg("minerip1");
+      String qminerip2 = server.arg("minerip2");
+      String qminerip3 = server.arg("minerip3");
+      String qminerip4 = server.arg("minerip4");
+      String qminerip5 = server.arg("minerip5");
       if (qsid.length() > 0 && qpass.length() > 0) {
         if(debug) Serial.println("clearing eeprom");
-        for (int i = 0; i < 112; ++i) {
+        for (int i = 0; i < 185; ++i) {
           EEPROM.write(i, 0);
         }
         // Write EEPROM ssid
@@ -586,14 +634,31 @@ void createWebServer() {
           EEPROM.write(32 + i, qpass[i]);
         }
         // Write EEPROM deadband
-        for (int i = 0; i < qdeadband.length(); ++i)
+        EEPROM.write(96, qdeadband[0]);
+
+        // Write EEPROM reset
+        EEPROM.write(97, 0);
+
+        // Write EEPROM miner ips
+        for (int i = 0; i < qminerip1.length(); ++i)
         {
-          EEPROM.write(96 + i, qdeadband[i]);
+          EEPROM.write(98 + i, qminerip1[i]);
         }
-        // Write EEPROM miner ip
-        for (int i = 0; i < qminerip.length(); ++i)
+        for (int i = 0; i < qminerip2.length(); ++i)
         {
-          EEPROM.write(97 + i, qminerip[i]);
+          EEPROM.write(113 + i, qminerip2[i]);
+        }
+        for (int i = 0; i < qminerip3.length(); ++i)
+        {
+          EEPROM.write(128 + i, qminerip3[i]);
+        }
+        for (int i = 0; i < qminerip4.length(); ++i)
+        {
+          EEPROM.write(143 + i, qminerip4[i]);
+        }
+        for (int i = 0; i < qminerip5.length(); ++i)
+        {
+          EEPROM.write(168 + i, qminerip5[i]);
         }
 
         EEPROM.commit();
@@ -615,12 +680,8 @@ void createWebServer() {
 
 void setup() {
 
-  // Initialize SDA/SCL via WIRE
-  Wire.begin(SDA, SCL);
-  if (! mpl115a2.begin()) {
-    addApplicationInfo("Sensor not found! Check wiring");
-    while (1);
-  }
+  // Initialize temperature sensor
+  tempSensor.begin();
 
   // Setup Screen
   lcd.init();
@@ -648,16 +709,20 @@ void setup() {
   delay(10);
   pinMode(15, INPUT);
 
-  // Read eeprom ssid
   addApplicationInfo("Reading SSID info");
+
   // Read eeprom ssid
   for (int i = 0; i < 32; ++i) {
-    esid += char(EEPROM.read(i));
+    if(EEPROM.read(i) != 255 && EEPROM.read(i) != 0) {
+      esid += char(EEPROM.read(i));
+    }
   }
 
   // Read eeprom password
   for (int i = 32; i < 96; ++i) {
-    epass += char(EEPROM.read(i));
+    if(EEPROM.read(i) != 255 && EEPROM.read(i) != 0) {
+      epass += char(EEPROM.read(i));
+    }
   }
 
   // Read eeprom deadband range
@@ -669,14 +734,63 @@ void setup() {
     }
   }
 
-  // Read eeprom miner ip
-  for (int i = 97; i < 112; ++i) {
-    eMinerIp += char(EEPROM.read(i));
+  // Read eeprom force config
+  if(EEPROM.read(97) == 1) {
+    forceConfig = true;
   }
-  minerIPAddressString = eMinerIp.c_str();
+
+  // Read eeprom miner ips
+  for (int i = 98; i < 113; ++i) {
+    if(EEPROM.read(i) != 255 && EEPROM.read(i) != 0) {
+      eMinerIp1 += char(EEPROM.read(i));
+    }
+  }
+  for (int i = 113; i < 128; ++i) {
+    if(EEPROM.read(i) != 255 && EEPROM.read(i) != 0) {
+      eMinerIp2 += char(EEPROM.read(i));
+    }
+  }
+  for (int i = 128; i < 143; ++i) {
+    if(EEPROM.read(i) != 255 && EEPROM.read(i) != 0) {
+      eMinerIp3 += char(EEPROM.read(i));
+    }
+  }
+  for (int i = 143; i < 168; ++i) {
+    if(EEPROM.read(i) != 255 && EEPROM.read(i) != 0) {
+      eMinerIp4 += char(EEPROM.read(i));
+    }
+  }
+  for (int i = 168; i < 183; ++i) {
+    if(EEPROM.read(i) != 255 && EEPROM.read(i) != 0) {
+      eMinerIp5 += char(EEPROM.read(i));
+    }
+  }
+
+  minerIpAddresses[0].fromString(eMinerIp1.c_str());
+  minerIpAddresses[1].fromString(eMinerIp2.c_str());
+  minerIpAddresses[2].fromString(eMinerIp3.c_str());
+  minerIpAddresses[3].fromString(eMinerIp4.c_str());
+  minerIpAddresses[4].fromString(eMinerIp5.c_str());
 
   // Print EEPROM settings for debugging
-  if(debug) Serial.println("EEPROM: SSID: " + esid + ", SSID-PASS: " + epass + ", DeadbandRange: " + thermostatDeadbandRange + ", Miner IP: " + minerIPAddressString);
+  if(debug) {
+    String forceConfigPrint = (forceConfig ? "true" : "false");
+    Serial.println("EEPROM: SSID: " + esid);
+    Serial.println("EEPROM: SSID-PASS: " + epass);
+    Serial.println("EEPROM: Deadband Range: " + thermostatDeadbandRange);
+    Serial.println("EEPROM: Miner IP(1): " + eMinerIp1);
+    Serial.println("EEPROM: Miner IP(2): " + eMinerIp2);
+    Serial.println("EEPROM: Miner IP(3): " + eMinerIp3);
+    Serial.println("EEPROM: Miner IP(4): " + eMinerIp4);
+    Serial.println("EEPROM: Miner IP(5): " + eMinerIp5);
+    Serial.println("EEPROM: Force Config: " + forceConfigPrint);
+  }
+
+  minerIpsFragmented = minerIpAddresses[0].toString();
+  if(eMinerIp2) minerIpsFragmented = minerIpsFragmented + " /" + minerIpAddresses[1][3];
+  if(eMinerIp3) minerIpsFragmented = minerIpsFragmented + "/" + minerIpAddresses[2][3];
+  if(eMinerIp4) minerIpsFragmented = minerIpsFragmented + "/" + minerIpAddresses[3][3];
+  if(eMinerIp5) minerIpsFragmented = minerIpsFragmented + "/" + minerIpAddresses[4][3];
 
   // Try to connect to wifi from stored credentials
   addApplicationInfo("Connecting to Wifi");
@@ -686,7 +800,7 @@ void setup() {
 void loop() {
 
   // Wifi is connected properly
-  if ((WiFi.status() == WL_CONNECTED))
+  if (forceConfig == false && (WiFi.status() == WL_CONNECTED))
   {
     // Refresh temperature status every 5 seconds
     if(screen != "init" && (millis() - lastTemperatureCheckInterrupt > 3000)) {
@@ -720,7 +834,7 @@ void loop() {
     if (lcd.getTouch(&x, &y)) {
         // Adjust temp down
         if(x > 45 && x < 95 && y > 45 && y < 95) {
-          if(millis() - lastTouchInterrupt > 500) {
+          if( millis() - lastTouchInterrupt > 500 ) {
             lastTouchInterrupt = millis();
             thermostatTargetTemp--;
             lcd.setTextColor(TFT_WHITE, TFT_BLACK);
@@ -738,16 +852,22 @@ void loop() {
             printCenter((String)thermostatTargetTemp, 0, 46, TFT_WHITE);
           }
         }
+        // Enter Config Mode
+        if(x >= 0 && x <= 90 && y >= 460 && y <= 480) {
+          EEPROM.write(97, 1);
+          EEPROM.commit();
+          ESP.restart();
+        }
       }
   }
 
   // Setup Access Point due to no internet connection
   if(firstRun) {
-    if (testWifi() && (digitalRead(15) != 1))
+    if (forceConfig == false && testWifi() && (digitalRead(15) != 1))
     {} else {
       // Setup HotSpot and show user that Connection is ready
-      // Connect to Azteco ATM Wifi Network to configure
       firstRun = false;
+      delay(50);
       clearApplicationInfo();
       addApplicationInfo("No Wifi, Hotspot on");
       addApplicationInfo("Connect to BitThermo");
